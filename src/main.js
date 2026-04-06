@@ -135,10 +135,35 @@ async function drainSyncQueue() {
 // ONLINE DETECTION + DELTA SYNC ENGINE
 // ─────────────────────────────────────────────────────────────────────────────
 // v1.0 b7
-const APP_VERSION = 'v1.0 b9';
+const APP_VERSION = 'v1.0 b10';
 
-let isOnline = navigator.onLine;
+let isOnline = false;   // selalu mulai false, dikonfirmasi via probeOnline()
 let _deltaTimer = null;
+
+/**
+ * probeOnline — cek koneksi ke Appwrite secara aktif.
+ * Jauh lebih reliable dari navigator.onLine di mobile.
+ * Timeout 6 detik. Return true jika berhasil.
+ */
+async function probeOnline() {
+  try {
+    const ctrl = new AbortController();
+    const tid  = setTimeout(() => ctrl.abort(), 6000);
+    // HEAD ke endpoint Appwrite — ringan, tanpa body
+    await fetch(APPWRITE_ENDPOINT + '/health', {
+      method:  'HEAD',
+      signal:  ctrl.signal,
+      cache:   'no-store',
+      headers: { 'X-Appwrite-Project': APPWRITE_PROJECT },
+    });
+    clearTimeout(tid);
+    isOnline = true;
+  } catch {
+    isOnline = false;
+  }
+  renderSyncBadge();
+  return isOnline;
+}
 
 // Sync state — dibaca oleh halaman Pengaturan untuk progress bar
 const syncState = {
@@ -218,8 +243,9 @@ function _fmtDateTime(iso) {
 }
 
 window.addEventListener('online', async () => {
-  isOnline = true;
-  renderSyncBadge();
+  // Konfirmasi benar-benar online via probe sebelum action
+  const ok = await probeOnline();
+  if (!ok) return;
   await drainSyncQueue();
   await runDeltaSync();
   showToast('Kembali online — data tersinkron', 'success');
@@ -231,6 +257,29 @@ window.addEventListener('offline', () => {
   stopDeltaTimer();
   showToast('Mode offline aktif', 'warn');
 });
+
+// Spinner sync pertama — tampil jika IDB belum pernah di-sync
+function showFirstSyncSpinner(msg = 'Memuat data pertama kali…') {
+  if (document.getElementById('first-sync-overlay')) return;
+  const el = document.createElement('div');
+  el.id = 'first-sync-overlay';
+  el.innerHTML = `
+    <div class="spinner"></div>
+    <div class="sync-msg">${msg}</div>
+    <div class="sync-sub" id="first-sync-sub">Menghubungkan ke server…</div>`;
+  document.body.appendChild(el);
+}
+function updateFirstSyncMsg(sub) {
+  const el = document.getElementById('first-sync-sub');
+  if (el) el.textContent = sub;
+}
+function hideFirstSyncSpinner() {
+  const el = document.getElementById('first-sync-overlay');
+  if (!el) return;
+  el.style.transition = 'opacity .4s';
+  el.style.opacity = '0';
+  setTimeout(() => el.remove(), 420);
+}
 
 function startDeltaTimer() {
   stopDeltaTimer();
@@ -270,15 +319,20 @@ async function runDeltaSync() {
   const now = new Date().toISOString();
 
   const targets = [
-    { col: COL_KELAS,       store: 'kelas' },
-    { col: COL_SISWA,       store: 'siswa' },
-    { col: COL_PELANGGARAN, store: 'pelanggaran' },
+    { col: COL_KELAS,       store: 'kelas',       label: 'Kelas' },
+    { col: COL_SISWA,       store: 'siswa',       label: 'Siswa' },
+    { col: COL_PELANGGARAN, store: 'pelanggaran', label: 'Pelanggaran' },
   ];
 
-  for (const { col, store } of targets) {
+  // Sync pertama: semua koleksi belum pernah di-sync → tampilkan spinner
+  const firstSync = !(await getLastSyncAt(COL_KELAS)) && !(await getLastSyncAt(COL_SISWA));
+  if (firstSync) showFirstSyncSpinner('Sinkronisasi data pertama kali…');
+
+  for (const { col, store, label } of targets) {
     try {
+      if (firstSync) updateFirstSyncMsg(`Memuat ${label}…`);
       const lastSyncAt = await getLastSyncAt(col);
-      const queries = [Query.limit(500)];
+      const queries = [Query.limit(2000)];
       if (lastSyncAt) {
         queries.push(Query.greaterThan('is_updated', lastSyncAt));
       } else {
@@ -327,6 +381,7 @@ async function runDeltaSync() {
   syncState.running  = false;
   syncState.lastSyncAt = now;
   _refreshSyncPanel();
+  if (firstSync) hideFirstSyncSpinner();
   return anyChange;
 }
 
@@ -368,58 +423,44 @@ function navigate(route) {
 // AUTH
 // ─────────────────────────────────────────────────────────────────────────────
 async function checkSession() {
-  // ── Langkah 1: baca session dari IDB terpisah — tidak butuh network ──────────
+  // ── Langkah 1: mulai probe koneksi (paralel, non-blocking) ───────────────────
+  const probePromise = probeOnline();
+
+  // ── Langkah 2: baca session dari IDB — tidak butuh network ───────────────────
   const cachedUser = await sessionLoad();
 
   if (cachedUser) {
-    // Ada session lokal → langsung masuk dashboard tanpa tunggu network
+    // Ada session lokal → langsung masuk dashboard tanpa tunggu probe
     state.user = cachedUser;
     navigate('dashboard');
-
-    // ── Langkah 2 (background, non-blocking): verifikasi ke Appwrite ──────────
-    // Hanya verifikasi jika koneksi ke Appwrite benar-benar bisa dijangkau.
-    // Tidak gunakan isOnline (tidak reliable) — probe fetch dulu.
-    _verifySessionBackground();
+    // Setelah probe selesai, verifikasi session di background (non-blocking)
+    probePromise.then(online => { if (online) _verifySessionBackground(); });
     return;
   }
 
-  // ── Langkah 3: belum pernah login — harus ada network ────────────────────────
+  // ── Langkah 3: tidak ada cache — tunggu probe, lalu coba Appwrite ────────────
+  const online = await probePromise;
+  if (!online) { navigate('login'); return; }
   try {
     state.user = await account.get();
     await sessionSave(state.user);
     navigate('dashboard');
-    if (isOnline) startDeltaTimer();
+    startDeltaTimer();
   } catch {
     navigate('login');
   }
 }
 
 async function _verifySessionBackground() {
-  // Probe: coba fetch endpoint Appwrite dengan timeout 5 detik.
-  // Jika gagal (timeout/network error) = offline → jangan force logout.
-  // Jika berhasil tapi session invalid (401) → force logout.
-  try {
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 5000);
-    const probeUrl = APPWRITE_ENDPOINT + '/health';
-    const res = await fetch(probeUrl, { signal: controller.signal, method: 'GET' });
-    clearTimeout(tid);
-    // Appwrite /health selalu 200 — jika sampai sini berarti online
-    isOnline = true;
-    renderSyncBadge();
-  } catch {
-    // Fetch gagal/abort = tidak bisa jangkau server = offline
-    // Jangan verifikasi session, tetap di dashboard
-    isOnline = false;
-    renderSyncBadge();
-    return;
-  }
+  const online = await probeOnline();
+  if (!online) return; // offline → tetap di dashboard, tidak force logout
 
   // Online terkonfirmasi → verifikasi session Appwrite
   try {
     const user = await account.get();
     state.user = user;
     await sessionSave(user);
+    await runDeltaSync(); // jalankan sync (dengan spinner jika pertama kali)
     startDeltaTimer();
   } catch {
     // Session benar-benar tidak valid (revoked/expired) → force logout
@@ -465,7 +506,7 @@ async function loadKelas() {
   if (isOnline) {
     try {
       const res = await db.listDocuments(DB_ID, COL_KELAS, [
-        Query.limit(200),
+        Query.limit(2000),
         Query.isNull('is_deleted'),
       ]);
       state.kelas = res.documents;
@@ -487,7 +528,7 @@ async function loadSiswa() {
     try {
       // Hanya fetch yang belum soft-deleted
       const res = await db.listDocuments(DB_ID, COL_SISWA, [
-        Query.limit(500),
+        Query.limit(2000),
         Query.isNull('is_deleted'),
       ]);
       state.siswa = res.documents;
@@ -518,7 +559,7 @@ async function loadSiswaForInput() {
 async function loadPelanggaran() {
   setLoading(true);
   const f = state.filter;
-  const queries = [Query.limit(500), Query.orderDesc('tanggal'), Query.isNull('is_deleted')];
+  const queries = [Query.limit(2000), Query.orderDesc('tanggal'), Query.isNull('is_deleted')];
   if (isOnline) {
     try {
       const res = await db.listDocuments(DB_ID, COL_PELANGGARAN, queries);
@@ -863,6 +904,26 @@ function injectCSS() {
     .pcard-meta { font-size:.78rem; color:var(--text3); margin-bottom:.5rem; }
     .pcard-catatan { color:var(--text2); font-size:.88rem; line-height:1.5; }
     .pcard-footer { display:flex; justify-content:space-between; align-items:center; margin-top:.75rem; padding-top:.65rem; border-top:1px solid var(--border); }
+
+    /* ── FIRST-SYNC SPINNER ── */
+    #first-sync-overlay {
+      position:fixed; inset:0; z-index:9998;
+      background:var(--bg);
+      display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1.25rem;
+    }
+    #first-sync-overlay .spinner {
+      width:52px; height:52px; border-radius:50%;
+      border:4px solid var(--border);
+      border-top-color:var(--accent);
+      animation:spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    #first-sync-overlay .sync-msg {
+      font-family:'DM Serif Display',serif; font-size:1.15rem; color:var(--text);
+    }
+    #first-sync-overlay .sync-sub {
+      font-size:.8rem; color:var(--text3);
+    }
 
     /* Print */
     @media print {
