@@ -100,7 +100,10 @@ async function deleteFromCache(store, id) {
   const d = await idb(); await d.delete(store, id);
 }
 async function addToSyncQueue(op) {
-  const d = await idb(); await d.add('syncQueue', { ...op, createdAt: Date.now() });
+  const d = await idb();
+  await d.add('syncQueue', { ...op, createdAt: Date.now() });
+  syncState.queueCount++;
+  _refreshSyncPanel();
 }
 
 // Baca/tulis timestamp lastSyncAt per koleksi ke IDB syncMeta
@@ -128,14 +131,17 @@ async function drainSyncQueue() {
       drained++;
     } catch { /* biarkan, coba lagi di siklus berikutnya */ }
   }
-  if (drained > 0) console.log('[Sync] drainQueue:', drained, 'ops dikirim');
+  if (drained > 0) {
+    console.log('[Sync] drainQueue:', drained, 'ops dikirim');
+    await _refreshQueueCount();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ONLINE DETECTION + DELTA SYNC ENGINE
 // ─────────────────────────────────────────────────────────────────────────────
 // v1.0 b7
-const APP_VERSION = 'v1.0 b10';
+const APP_VERSION = 'v1.0 b11';
 
 let isOnline = false;   // selalu mulai false, dikonfirmasi via probeOnline()
 let _deltaTimer = null;
@@ -171,8 +177,19 @@ const syncState = {
   nextSyncIn:   100,       // detik hitung mundur
   lastSyncAt:   null,      // ISO string waktu sync terakhir selesai
   lastLog:      [],        // array { col, count, ts } dari sync terakhir
+  queueCount:   0,         // jumlah dokumen offline belum dikirim
   _countdownTimer: null,
 };
+
+/** Refresh queueCount dari IDB dan update panel */
+async function _refreshQueueCount() {
+  try {
+    const d = await idb();
+    const queue = await d.getAll('syncQueue');
+    syncState.queueCount = queue.length;
+  } catch { syncState.queueCount = 0; }
+  _refreshSyncPanel();
+}
 
 function _tickCountdown() {
   if (!isOnline || !_deltaTimer) return;
@@ -199,6 +216,7 @@ function _refreshSyncPanel() {
   const nxt = document.getElementById('sync-next-in');
   const log = document.getElementById('sync-log-table');
   const sta = document.getElementById('sync-status-label');
+  const qel = document.getElementById('sync-queue-count');
 
   const ratio = syncState.nextSyncIn / 100;
 
@@ -215,6 +233,16 @@ function _refreshSyncPanel() {
         ? (syncState.lastSyncAt ? `✅ Terakhir: ${_fmtDateTime(syncState.lastSyncAt)}` : '⏳ Belum sync')
         : '🔴 Offline — sync ditunda';
   if (sta)  sta.style.color  = syncState.running ? 'var(--info)' : isOnline ? 'var(--success)' : 'var(--danger)';
+
+  // Antrian dokumen offline
+  if (qel) {
+    const q = syncState.queueCount;
+    if (q === 0) {
+      qel.innerHTML = '<span class="badge badge-success">✓ Tidak ada antrian</span>';
+    } else {
+      qel.innerHTML = `<span class="badge badge-warn">⏳ ${q} dokumen menunggu dikirim</span>`;
+    }
+  }
 
   if (log && syncState.lastLog.length > 0) {
     const labelMap = {
@@ -243,11 +271,11 @@ function _fmtDateTime(iso) {
 }
 
 window.addEventListener('online', async () => {
-  // Konfirmasi benar-benar online via probe sebelum action
   const ok = await probeOnline();
   if (!ok) return;
   await drainSyncQueue();
   await runDeltaSync();
+  _reloadActiveRoute();
   showToast('Kembali online — data tersinkron', 'success');
   startDeltaTimer();
 });
@@ -287,16 +315,20 @@ function startDeltaTimer() {
   _deltaTimer = setInterval(async () => {
     if (!isOnline || !state.user) return;
     await drainSyncQueue();
-    const changed = await runDeltaSync();
-    // Reset hitung mundur untuk siklus berikutnya
+    await runDeltaSync();
+    // Selalu reload halaman aktif setelah sync — data IDB mungkin berubah
+    _reloadActiveRoute();
     _startCountdown();
-    if (changed) {
-      if (state.route === 'dashboard') loadPelanggaran();
-      else if (state.route === 'kelas') loadKelas();
-      else if (state.route === 'siswa') loadSiswaPage();
-    }
   }, 100_000);
   console.log('[Sync] Delta timer dimulai (interval 100 detik)');
+}
+
+/** Reload data halaman yang sedang aktif dari IDB (tanpa navigate ulang) */
+function _reloadActiveRoute() {
+  if (state.route === 'dashboard')  loadPelanggaran();
+  else if (state.route === 'kelas') loadKelas();
+  else if (state.route === 'siswa') loadSiswaPage();
+  else if (state.route === 'input') loadSiswaForInput();
 }
 function stopDeltaTimer() {
   if (_deltaTimer) { clearInterval(_deltaTimer); _deltaTimer = null; }
@@ -460,10 +492,10 @@ async function _verifySessionBackground() {
     const user = await account.get();
     state.user = user;
     await sessionSave(user);
-    await runDeltaSync(); // jalankan sync (dengan spinner jika pertama kali)
+    await runDeltaSync(); // spinner otomatis jika sync pertama
+    _reloadActiveRoute(); // muat ulang data terbaru ke halaman aktif
     startDeltaTimer();
   } catch {
-    // Session benar-benar tidak valid (revoked/expired) → force logout
     _forceLogout();
   }
 }
@@ -499,48 +531,19 @@ async function doLogout() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// DATA FETCHING — online-first, fallback IDB
+// DATA FETCHING — selalu dari IDB (delta sync yang update cache)
 // ─────────────────────────────────────────────────────────────────────────────
 async function loadKelas() {
   setLoading(true);
-  if (isOnline) {
-    try {
-      const res = await db.listDocuments(DB_ID, COL_KELAS, [
-        Query.limit(2000),
-        Query.isNull('is_deleted'),
-      ]);
-      state.kelas = res.documents;
-      await cacheAll('kelas', res.documents);
-    } catch {
-      const all = await getFromCache('kelas');
-      state.kelas = all.filter(k => !k.is_deleted);
-    }
-  } else {
-    const all = await getFromCache('kelas');
-    state.kelas = all.filter(k => !k.is_deleted);
-  }
+  const all = await getFromCache('kelas');
+  state.kelas = all.filter(k => !k.is_deleted);
   setLoading(false);
   render();
 }
 
 async function loadSiswa() {
-  if (isOnline) {
-    try {
-      // Hanya fetch yang belum soft-deleted
-      const res = await db.listDocuments(DB_ID, COL_SISWA, [
-        Query.limit(2000),
-        Query.isNull('is_deleted'),
-      ]);
-      state.siswa = res.documents;
-      await cacheAll('siswa', res.documents);
-    } catch {
-      const all = await getFromCache('siswa');
-      state.siswa = all.filter(s => !s.is_deleted);
-    }
-  } else {
-    const all = await getFromCache('siswa');
-    state.siswa = all.filter(s => !s.is_deleted);
-  }
+  const all = await getFromCache('siswa');
+  state.siswa = all.filter(s => !s.is_deleted);
 }
 
 async function loadSiswaPage() {
@@ -558,24 +561,10 @@ async function loadSiswaForInput() {
 
 async function loadPelanggaran() {
   setLoading(true);
-  const f = state.filter;
-  const queries = [Query.limit(2000), Query.orderDesc('tanggal'), Query.isNull('is_deleted')];
-  if (isOnline) {
-    try {
-      const res = await db.listDocuments(DB_ID, COL_PELANGGARAN, queries);
-      state.pelanggaran = res.documents;
-      await cacheAll('pelanggaran', res.documents);
-    } catch {
-      const all = await getFromCache('pelanggaran');
-      state.pelanggaran = all.filter(p => !p.is_deleted).sort((a,b) => new Date(b.tanggal) - new Date(a.tanggal));
-    }
-  } else {
-    const all = await getFromCache('pelanggaran');
-    // Filter soft-deleted + sort tanggal desc
-    state.pelanggaran = all
-      .filter(p => !p.is_deleted)
-      .sort((a, b) => new Date(b.tanggal) - new Date(a.tanggal));
-  }
+  const all = await getFromCache('pelanggaran');
+  state.pelanggaran = all
+    .filter(p => !p.is_deleted)
+    .sort((a, b) => new Date(b.tanggal) - new Date(a.tanggal));
   if (!state.siswa.length) await loadSiswa();
   if (!state.kelas.length) await loadKelas();
   setLoading(false);
@@ -584,19 +573,9 @@ async function loadPelanggaran() {
 
 async function loadPengaturan() {
   setLoading(true);
-  if (isOnline) {
-    try {
-      const res = await db.getDocument(DB_ID, COL_PENGATURAN, PENGATURAN_DOC_ID);
-      state.pengaturan = res;
-      const d = await idb(); await d.put('pengaturan', { key: 'main', ...res });
-    } catch (e) {
-      const d = await idb(); const c = await d.get('pengaturan', 'main');
-      state.pengaturan = c || {};
-    }
-  } else {
-    const d = await idb(); const c = await d.get('pengaturan', 'main');
-    state.pengaturan = c || {};
-  }
+  const d = await idb();
+  const c = await d.get('pengaturan', 'main');
+  state.pengaturan = c || {};
   setLoading(false);
   render();
 }
@@ -1463,6 +1442,12 @@ function renderPengaturan() {
     <div class="card">
       <div class="card-header">🔄 Sinkronisasi Delta</div>
 
+      <!-- Antrian offline -->
+      <div style="margin-bottom:.85rem">
+        <div style="font-size:.75rem;font-weight:600;color:var(--text2);letter-spacing:.05em;text-transform:uppercase;margin-bottom:.35rem">Antrian Offline</div>
+        <div id="sync-queue-count"><span class="badge badge-info">Memuat…</span></div>
+      </div>
+
       <!-- Status label -->
       <div id="sync-status-label" style="font-size:.85rem;margin-bottom:.85rem;font-weight:600">
         ⏳ Memuat status…
@@ -1538,8 +1523,8 @@ function bindPengaturan() {
     btn.textContent = '⚡ Sync Sekarang';
     showToast('Sync selesai', 'success');
   };
-  // Render panel segera setelah halaman terbuka
-  _refreshSyncPanel();
+  // Load queue count & render panel saat halaman dibuka
+  _refreshQueueCount().then(() => _refreshSyncPanel());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
